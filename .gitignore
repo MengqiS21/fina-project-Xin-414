@@ -1,0 +1,14 @@
+**/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local SQLite (created on first run)
+data/*.db
+
+# Secrets
+.env
