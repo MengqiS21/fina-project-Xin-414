@@ -26,12 +26,13 @@ The array must contain between 3 and 5 objects (inclusive). Each object must be 
 - estimated_cost
 - portion_note
 - why_solo_friendly
+- address
 
-Use realistic restaurant or food-spot suggestions. All field values must be non-empty strings."""
+Use real, existing restaurant or food-spot suggestions. For the address field, provide the actual street address if known, or the neighborhood/area (e.g. "Capitol Hill, Seattle" or "123 Main St, Seattle, WA"). All field values must be non-empty strings."""
 
 RETRY_USER_SUFFIX = """
 
-CRITICAL: Your previous reply was not usable because it was not valid JSON or did not match the required shape. Reply again with ONLY a JSON array (characters [ ... ]), containing 3 to 5 objects. Each object must include exactly these keys: "name", "cuisine", "estimated_cost", "portion_note", "why_solo_friendly". No markdown, no commentary."""
+CRITICAL: Your previous reply was not usable because it was not valid JSON or did not match the required shape. Reply again with ONLY a JSON array (characters [ ... ]), containing 3 to 5 objects. Each object must include exactly these keys: "name", "cuisine", "estimated_cost", "portion_note", "why_solo_friendly", "address". No markdown, no commentary."""
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class DiningPreferences:
     mood: str
     portion_pref: str
     location: str | None = None
+    dietary_restrictions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,7 @@ class Recommendation:
     estimated_cost: str
     portion_note: str
     why_solo_friendly: str
+    address: str = ""
 
 
 class LlmError(Exception):
@@ -60,7 +63,7 @@ class LlmError(Exception):
 
 
 _REQUIRED_KEYS = frozenset(
-    {"name", "cuisine", "estimated_cost", "portion_note", "why_solo_friendly"}
+    {"name", "cuisine", "estimated_cost", "portion_note", "why_solo_friendly", "address"}
 )
 
 
@@ -85,6 +88,11 @@ def _build_user_prompt(prefs: DiningPreferences) -> str:
     else:
         parts.append(
             "Location: not specified—offer general suggestions not tied to a specific neighborhood."
+        )
+    if prefs.dietary_restrictions:
+        restrictions = ", ".join(prefs.dietary_restrictions)
+        parts.append(
+            f"Dietary restrictions: {restrictions}. All suggestions must respect these restrictions."
         )
     parts.append("I am eating alone.")
     return " ".join(parts)
@@ -130,6 +138,7 @@ def _parse_response_to_recommendations(text: str) -> list[Recommendation]:
             estimated_cost=r["estimated_cost"],
             portion_note=r["portion_note"],
             why_solo_friendly=r["why_solo_friendly"],
+            address=r["address"],
         )
         for r in rows
     ]

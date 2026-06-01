@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import streamlit as st
 
-from db import fetch_recommendation_history, init_db, save_recommendation
+from db import fetch_recommendation_history, init_db, save_recommendation, update_rating
 from llm import DiningPreferences, LlmError, Recommendation, generate_recommendations
 
 st.set_page_config(page_title="Solo meal planner", layout="wide", page_icon="\U0001f371")
@@ -13,6 +15,7 @@ st.set_page_config(page_title="Solo meal planner", layout="wide", page_icon="\U0
 BUDGET_OPTIONS = ("", "Under $10", "$10–20", "$20+")
 MOOD_OPTIONS = ("", "Comfort food", "Healthy", "Quick", "Adventurous")
 PORTION_OPTIONS = ("", "Small", "Medium", "Regular")
+DIETARY_OPTIONS = ("Vegetarian", "Vegan", "Gluten-free", "Nut-free", "Dairy-free", "Halal", "Kosher")
 
 _PLACEHOLDER = {
     "budget": "Select budget…",
@@ -39,7 +42,7 @@ def _validate_required(budget: str, mood: str, portion: str) -> list[str]:
 
 
 def _normalize_location(raw: str) -> str | None:
-    s = raw.strip()
+    s = raw.strip()[:120]
     return s if s else None
 
 
@@ -49,16 +52,84 @@ def _option_index(options: tuple[str, ...], value: str) -> int | None:
     return None
 
 
+def _render_pick_card(
+    index: int,
+    *,
+    name: str,
+    cuisine: str,
+    estimated_cost: str,
+    portion_note: str,
+    why_solo_friendly: str,
+    address: str = "",
+) -> None:
+    """One bordered recommendation card (Planner results and History)."""
+    with st.container(border=True):
+        st.markdown(f"#### Pick {index}")
+        st.markdown(f"**Name:** {name}")
+        st.markdown(f"**Cuisine:** {cuisine}")
+        st.markdown(f"**Estimated cost:** {estimated_cost}")
+        st.markdown(f"**Portion note:** {portion_note}")
+        st.markdown(f"**Why solo-friendly:** {why_solo_friendly}")
+        if address:
+            st.caption(f"📍 {address}")
+
+
 def _render_recommendation_cards(recs: list[Recommendation]) -> None:
-    """One readable block per suggestion with all five fields."""
     for i, r in enumerate(recs, start=1):
-        with st.container(border=True):
-            st.markdown(f"#### Pick {i}")
-            st.markdown(f"**Name:** {r.name}")
-            st.markdown(f"**Cuisine:** {r.cuisine}")
-            st.markdown(f"**Estimated cost:** {r.estimated_cost}")
-            st.markdown(f"**Portion note:** {r.portion_note}")
-            st.markdown(f"**Why solo-friendly:** {r.why_solo_friendly}")
+        _render_pick_card(
+            i,
+            name=r.name,
+            cuisine=r.cuisine,
+            estimated_cost=r.estimated_cost,
+            portion_note=r.portion_note,
+            why_solo_friendly=r.why_solo_friendly,
+            address=r.address,
+        )
+
+
+def _format_history_timestamp(raw: str) -> str:
+    """Show a readable label in History expanders."""
+    text = (raw or "").strip()
+    if not text:
+        return "Unknown time"
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.strftime("%b %d, %Y %I:%M %p")
+    except ValueError:
+        return text
+
+
+def _history_summary(entry: dict) -> str:
+    when = _format_history_timestamp(str(entry.get("created_at", "")))
+    budget = entry.get("budget") or "Any budget"
+    mood = entry.get("mood") or "Any mood"
+    portion = entry.get("portion_pref") or "Any portion"
+    return f"{when} | {budget} / {mood} / {portion}"
+
+
+def _render_rating_section() -> None:
+    """Thumbs-up / thumbs-down feedback for the current recommendation set."""
+    row_id = st.session_state.get("last_recommendation_id")
+    if not row_id:
+        return
+    rating_key = f"rating_{row_id}"
+    current = st.session_state.get(rating_key)
+    st.markdown("**Was this helpful?**")
+    c1, c2, _ = st.columns([1, 1, 6])
+    with c1:
+        if st.button("👍", key=f"up_{row_id}", disabled=(current == 1)):
+            update_rating(row_id, 1)
+            st.session_state[rating_key] = 1
+            st.rerun()
+    with c2:
+        if st.button("👎", key=f"down_{row_id}", disabled=(current == -1)):
+            update_rating(row_id, -1)
+            st.session_state[rating_key] = -1
+            st.rerun()
+    if current == 1:
+        st.caption("Thanks for the feedback! 👍")
+    elif current == -1:
+        st.caption("Thanks for the feedback! Try adjusting your preferences. 👎")
 
 
 def _render_results_actions() -> None:
@@ -88,13 +159,15 @@ def _render_results_actions() -> None:
             st.error(str(err))
         else:
             st.session_state["last_recommendations"] = new_recs
-            save_recommendation(
+            row_id = save_recommendation(
                 budget=prefs.budget,
                 mood=prefs.mood,
                 portion_pref=prefs.portion_pref,
                 location=prefs.location,
                 results=new_recs,
+                dietary_restrictions=prefs.dietary_restrictions,
             )
+            st.session_state["last_recommendation_id"] = row_id
             st.rerun()
 
     if refine:
@@ -104,28 +177,57 @@ def _render_results_actions() -> None:
         st.rerun()
 
 
+def _render_history_charts(history: list[dict]) -> None:
+    """Bar charts showing mood and budget distribution across all searches."""
+    if len(history) < 2:
+        return
+    from collections import Counter
+    import pandas as pd
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.caption("Mood breakdown")
+        mood_counts = Counter(e["mood"] for e in history if e.get("mood"))
+        if mood_counts:
+            st.bar_chart(pd.Series(mood_counts))
+    with col2:
+        st.caption("Budget breakdown")
+        budget_counts = Counter(e["budget"] for e in history if e.get("budget"))
+        if budget_counts:
+            st.bar_chart(pd.Series(budget_counts))
+
+
 def _render_history_page() -> None:
     """Display persisted recommendations in reverse chronological order."""
     st.divider()
-    st.subheader("History")
+    st.subheader("\U0001f4dc Your history")
     history = fetch_recommendation_history()
     if not history:
-        st.info("No history yet. Submit your first search on Planner.")
+        st.info("No history yet. Submit your first search on **Planner**.")
         return
 
-    st.caption(f"{len(history)} saved searches")
+    st.caption(f"{len(history)} saved search{'es' if len(history) != 1 else ''}")
+    _render_history_charts(history)
+    st.divider()
+
     for entry in history:
         location_text = entry["location"] or "General suggestions"
-        with st.expander(
-            f"{entry['created_at']} — {entry['budget']} / {entry['mood']} / {entry['portion_pref']}",
-            expanded=False,
-        ):
-            if st.button("Use these inputs", key=f"use_history_{entry['id']}"):
+        rating = entry.get("rating")
+        rating_badge = " 👍" if rating == 1 else (" 👎" if rating == -1 else "")
+        with st.expander(_history_summary(entry) + rating_badge, expanded=False):
+            if st.button(
+                "Use these inputs",
+                key=f"use_history_{entry['id']}",
+                use_container_width=True,
+                help="Prefill the Planner form with this search.",
+            ):
+                dr = entry.get("dietary_restrictions") or []
                 st.session_state["last_preferences"] = DiningPreferences(
                     budget=entry["budget"] or "",
                     mood=entry["mood"] or "",
                     portion_pref=entry["portion_pref"] or "",
                     location=entry["location"],
+                    dietary_restrictions=tuple(dr),
                 )
                 st.session_state["last_recommendations"] = []
                 st.session_state["_apply_refine_prefill"] = True
@@ -133,31 +235,34 @@ def _render_history_page() -> None:
                 st.session_state["view_mode"] = "Planner"
                 st.rerun()
 
+            dr_list = entry.get("dietary_restrictions") or []
+            dr_text = ", ".join(dr_list) if dr_list else "None"
             st.markdown(
-                f"**Timestamp:** {entry['created_at']}  \n"
-                f"**Budget:** {entry['budget']}  \n"
-                f"**Mood:** {entry['mood']}  \n"
-                f"**Portion:** {entry['portion_pref']}  \n"
+                f"**When:** {_format_history_timestamp(str(entry['created_at']))}  \n"
+                f"**Budget:** {entry['budget'] or '-'}  \n"
+                f"**Mood:** {entry['mood'] or '-'}  \n"
+                f"**Portion:** {entry['portion_pref'] or '-'}  \n"
+                f"**Dietary:** {dr_text}  \n"
                 f"**Location:** {location_text}"
             )
 
             results = entry["results"] if isinstance(entry["results"], list) else []
             if not results:
-                st.caption("No parsed recommendation results in this row.")
+                st.caption("No saved recommendations for this search.")
                 continue
 
             for i, item in enumerate(results, start=1):
                 if not isinstance(item, dict):
                     continue
-                with st.container(border=True):
-                    st.markdown(f"#### Result {i}")
-                    st.markdown(f"**Name:** {item.get('name', '-')}")
-                    st.markdown(f"**Cuisine:** {item.get('cuisine', '-')}")
-                    st.markdown(f"**Estimated cost:** {item.get('estimated_cost', '-')}")
-                    st.markdown(f"**Portion note:** {item.get('portion_note', '-')}")
-                    st.markdown(
-                        f"**Why solo-friendly:** {item.get('why_solo_friendly', '-')}"
-                    )
+                _render_pick_card(
+                    i,
+                    name=str(item.get("name") or "-"),
+                    cuisine=str(item.get("cuisine") or "-"),
+                    estimated_cost=str(item.get("estimated_cost") or "-"),
+                    portion_note=str(item.get("portion_note") or "-"),
+                    why_solo_friendly=str(item.get("why_solo_friendly") or "-"),
+                    address=str(item.get("address") or ""),
+                )
 
 
 def _inject_theme_css() -> None:
@@ -270,6 +375,22 @@ def _inject_theme_css() -> None:
     color: #3d2a26 !important;
     border: none !important;
   }
+  [data-testid="stExpander"] button[kind="secondary"],
+  [data-testid="stExpander"] button[kind="primary"] {
+    min-height: 44px !important;
+    border-radius: 9999px !important;
+    font-weight: 700 !important;
+    background: #ffffff !important;
+    color: var(--meal-text) !important;
+    border: 2px solid #dccfc4 !important;
+  }
+  [data-testid="stRadio"] label {
+    font-weight: 700 !important;
+    color: var(--meal-text) !important;
+  }
+  [data-testid="stRadio"] [data-baseweb="radio"] {
+    gap: 0.75rem !important;
+  }
   div[data-baseweb="select"] > div,
   div[data-baseweb="input"] > div {
     border-radius: 14px !important;
@@ -303,6 +424,12 @@ def _inject_theme_css() -> None:
   [data-testid="stAlert"] {
     border-radius: 14px !important;
   }
+  [data-testid="stError"] {
+    border-radius: 14px !important;
+  }
+  [data-testid="stSpinner"] {
+    color: var(--meal-strawberry) !important;
+  }
 </style>
         """,
         unsafe_allow_html=True,
@@ -314,7 +441,8 @@ _inject_theme_css()
 
 st.title("\U0001f371 Solo Dining Recommender")
 st.markdown(
-    "Pick your **solo meal vibe**—we’ll match you with cozy spots. Fields marked **required** need a choice before we search."
+    "Pick your **solo meal vibe** and we will match you with cozy spots. "
+    "Fields marked **required** need a choice before we search."
 )
 
 page = st.radio(
@@ -338,13 +466,14 @@ _budget_idx = _option_index(BUDGET_OPTIONS, _lp.budget) if _lp else None
 _mood_idx = _option_index(MOOD_OPTIONS, _lp.mood) if _lp else None
 _portion_idx = _option_index(PORTION_OPTIONS, _lp.portion_pref) if _lp else None
 _location_default = (_lp.location or "") if _lp else ""
+_dietary_default = list(_lp.dietary_restrictions) if _lp else []
 
 with st.form("preferences_form", clear_on_submit=False):
     if st.session_state.pop("_show_refine_hint", False):
         st.info(
             "Adjust your choices in this form, then click **Find me something** again."
         )
-    st.caption("Required: budget, mood, and portion. Location is optional.")
+    st.caption("Required: budget, mood, and portion. Location and dietary filters are optional.")
 
     c1, c2 = st.columns(2, gap="large")
     with c1:
@@ -381,6 +510,14 @@ with st.form("preferences_form", clear_on_submit=False):
         portion_kw["index"] = _portion_idx
     portion = st.selectbox(**portion_kw)
 
+    dietary = st.multiselect(
+        "Dietary restrictions (optional)",
+        options=DIETARY_OPTIONS,
+        default=_dietary_default,
+        help="Select any dietary restrictions or allergies. All suggestions will respect these.",
+        label_visibility="visible",
+    )
+
     _loc_kw: dict = {
         "label": "Location (optional)",
         "max_chars": 120,
@@ -413,33 +550,27 @@ if submitted:
             mood=mood,
             portion_pref=portion,
             location=loc,
+            dietary_restrictions=tuple(dietary),
         )
         st.session_state["last_preferences"] = prefs
 
-        st.markdown("**Submitted values (passed to the AI layer)**")
-        st.json(
-            {
-                "budget": prefs.budget,
-                "mood": prefs.mood,
-                "portion_pref": prefs.portion_pref,
-                "location": prefs.location,
-            }
-        )
-
         try:
-            recs = generate_recommendations(prefs)
+            with st.spinner("Finding tasty spots for you…"):
+                recs = generate_recommendations(prefs)
         except LlmError as err:
             st.session_state["last_recommendations"] = []
             st.error(str(err))
         else:
             st.session_state["last_recommendations"] = recs
-            save_recommendation(
+            row_id = save_recommendation(
                 budget=prefs.budget,
                 mood=prefs.mood,
                 portion_pref=prefs.portion_pref,
                 location=prefs.location,
                 results=recs,
+                dietary_restrictions=prefs.dietary_restrictions,
             )
+            st.session_state["last_recommendation_id"] = row_id
             st.success("Here are tailored suggestions for your solo meal.")
 
 recs = st.session_state.get("last_recommendations") or []
@@ -450,17 +581,10 @@ if (
 ):
     st.divider()
     st.subheader("\U0001f35c Tasty picks for you")
+    st.caption(
+        "⚠️ Suggestions are AI-generated. Restaurant details may vary — always verify before visiting."
+    )
     _render_recommendation_cards(recs)
+    st.divider()
+    _render_rating_section()
     _render_results_actions()
-
-if st.session_state.get("last_preferences") and not submitted:
-    p = st.session_state["last_preferences"]
-    with st.expander("Last submitted preferences (this session)", expanded=False):
-        st.json(
-            {
-                "budget": p.budget,
-                "mood": p.mood,
-                "portion_pref": p.portion_pref,
-                "location": p.location,
-            }
-        )
